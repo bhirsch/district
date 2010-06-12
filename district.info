@@ -1,0 +1,10 @@
+; $Id$
+name = "District"
+description = "This module uses Sunlight Labs APIs \ 
+to create a current list of US political districts, then look up\
+and tag geocoded content with corresponding political districts \
+and their elected officials."
+core = 6.x
+php = 5.1
+package = Democracy
+dependencies[] = location

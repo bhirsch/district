@@ -1,0 +1,196 @@
+<?php
+// $Id$
+/**
+ * Install the district module, and its two tables:
+ * district and district_node.
+ * @file
+ */
+
+/**
+ * Implementation of hook_install().
+ */
+function district_install() {
+  drupal_install_schema('district');
+  drupal_install_schema('district_node');
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function district_uninstall() {
+  drupal_uninstall_schema('district');
+  drupal_uninstall_schema('district_node');
+  // Set admin/settings/district variables to null
+  // otherwise the user will not be prompted to recreate
+  // tables and terms upon reinstallation.
+  variable_set('district_data_populated', null);
+  variable_set('district_taxonomy_created', null);
+  variable_set('district_term_node', null);
+  // Delete vocabularies and related term data.
+  // Start with  the 
+  // term_node table (by tid, NOT by vid, vid in 
+  // term_node is version id NOT vocab id).
+  $vocab[] = 'State';
+  $vocab[] = 'District';
+  $vocab[] = 'Legislator';
+  $vocab[] = 'Party';
+  $vocab[] = 'District/Legislator';
+  foreach ($vocab as $vocab) {
+    $results = db_query("SELECT vid FROM {vocabulary} WHERE name = '%s' ", $vocab);
+    $vid = db_result($results);
+    // Get all terms for vocabulary 
+    $results = db_query("SELECT tid FROM {term_data} WHERE vid = %d ", $vid);
+    while ($tid = db_result($results)) {
+      // term node table: delete records by $tid
+      db_query("DELETE FROM {term_node} WHERE tid = %d ", $tid);
+    }
+    // term_data table: delete terms by $vid
+    db_query("DELETE FROM {term_data} WHERE vid = %d ", $vid);    
+    // vocabulary_node_types table: delete types by $vid
+    db_query("DELETE FROM {vocabulary_node_types} WHERE vid = %d ", $vid);    
+    // vocabulary table: delete vocabularies by $vid
+    db_query("DELETE FROM {vocabulary} WHERE vid = %d ", $vid);    
+  } 
+}
+
+/**
+ * Implementation of hook_schema().
+ *
+ * This module has two tables: district and district_node.
+ *
+ * The district table stores information about political districts
+ * from Sunlight Labs and reformats some of this information 
+ * to create vocabulary terms. But we cannot actually populate the
+ * table with data yet. That must be done from the admin page
+ * because it requires the user to register with Sunlight Labs
+ * and input an API key first.
+ *
+ * The district_node table stores sets of nids, lids (locations)
+ * and district_ids, matching geocoded content nodes
+ * with political districts. The
+ */
+function district_schema() {
+  $schema['district'] = array(
+    'fields' => array(
+      'district_id' => array(
+        'type' => 'serial',
+	'unsigned' => TRUE,
+	'not null' => TRUE,
+      ),
+      'state' => array(
+        'type' => 'varchar',
+	'length' => 2,
+	'not null' => TRUE,
+	'default' => 0,
+      ),
+      'dist_name' => array(
+        'type' => 'varchar',
+        'length' => 150,
+        'not null' => TRUE,
+	'default' => '',
+      ),
+      // The level field is not used by Sunlight Labs,
+      // it is used by Mobile Commons, which is working on  
+      // an API to draw district polygons.
+      'level' => array(
+        'type' => 'varchar',
+	'length' => 150,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'leg_firstname' => array(
+        'type' => 'varchar', 
+	'length' => 35,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'leg_lastname' => array(
+        'type' => 'varchar',
+	'length' => 35,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'leg_title' => array(
+        'type' => 'varchar',
+	'length' => 15,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'leg_party' => array(
+        'type' => 'varchar',
+	'length' => 1,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'term_dist' => array(
+        'type' => 'varchar',
+	'length' => 150,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'term_leg' => array(
+        'type' => 'varchar',
+	'length' => 80,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'term_party' => array(
+        'type' => 'varchar',
+	'length' => 20,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'term_dist_leg' => array(
+        'type' => 'varchar',
+	'length' => 200,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+    ),
+    'indexes' => array('term_dist' => array('term_dist')),
+    // District ID is primary key
+    'primary key' => array('district_id'),
+  );
+  $schema ['district_node'] = array(
+    'fields' => array(
+      'district_id' => array(
+        'type' => int,
+	'unsigned' => TRUE,
+	'not null' => TRUE,
+	'default' => 0,
+      ),
+      'term_dist' => array(
+        'type' => 'varchar',
+	'length' => 150,
+	'not null' => TRUE,
+	'default' => '',
+      ),
+      'nid' => array(
+        'type' => int,
+	'unsigned' => TRUE,
+	'not null' => TRUE,
+	'default' => 0,
+      ),
+      // Location id
+      'lid' => array(
+        'type' => int,
+	'unsigned' => TRUE,
+	'not null' => TRUE,
+	'default' => 0,
+      ),
+      'added_to_term_node' => array(
+        'type' => int,
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array('district_id' => array('district_id')),
+    'primary key' => array(
+      'nid', 'term_dist'
+    ),
+  );
+
+  return $schema;
+}
+

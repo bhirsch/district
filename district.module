@@ -1,0 +1,685 @@
+<?php 
+// $Id$
+/**
+ * Creates political district taxonomy and tags geocoded content.
+ * @file
+ */
+
+/**
+ * Implementation of hook_help().
+ */
+function district_help($path, $arg) {
+  if ($path == 'admin/help#district') {
+    $txt = 'The District module requires a Sunlight Labs '
+      .'API key. You can register for a key and here: '
+      .'http://services.sunlightlabs.com/api/, and find out'
+      .'more about Sunlight Labs and their APIs at their documentation wiki'
+      .'http://wiki.sunlightlabs.com/Sunlight_API_Documentation'
+      .'and main website http://www.sunlightlabs.com/.';
+    $replace = array();
+
+    return '<p>'. t($txt, $replace) .'</p>';
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function district_menu() {
+  // Page callback for admin/settings page
+  $items['admin/settings/district'] = array(
+    'title' => 'District',
+    'page callback' => ('drupal_get_form'),
+    'page arguments' => array('district_admin_settings'),
+    'access arguments' => array('administer district'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  // Callback to populate district table w data
+  $items['admin/settings/district/populate'] = array(
+    'title' => 'Populate District Table',
+    'page callback' => 'district_populate',
+    'access arguments' => array('administer district'),
+    'type' => MENU_CALLBACK,
+  );
+  // Callback to create district taxonomy
+  $items['admin/settings/district/taxonomy'] = array(
+   'page callback' => 'district_taxonomy',
+   'access arguments' => array('administer district'),
+   'type' => MENU_CALLBACK,
+  );
+  // Callback to update district_node table and 
+  // related taxonomy terms (term_node table)
+  $items['admin/settings/district/term_node'] = array(
+    'page callback' => 'district_term_node',
+    'access arguments' => array('administer district'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_perm()
+ */
+function district_perm() {
+  return array('administer district');
+}
+
+/**
+ * Update district_node table with new geocoded
+ * nodes and corresponding political districts. Then
+ * tag the nodes with related taxonomy terms.
+ * (That is, update the term_node table.)
+ * Menu callback for admin/settings/district/term_node
+ */
+function district_term_node() {
+  // Find nodes with lat/lng coordinates that do not
+  // have district tags (they are not in district_node).
+  // Add them to the district_node table.
+  district_nodes_new();
+
+  // Now district_node has a bunch of new nodes
+  // with term_dist, but no district_id. Get district_ids
+  // from the district table.
+  district_getids(); 
+
+  $i = 0;
+  // iterate through adding records to disrict_node
+  for ($i = 0; $i < 2; $i++) {
+  $i = 2;
+
+  // For each new record in the district_node table
+  // add State, District, Legislator, Party, and District/Legislator
+  // terms to term_node. Each new record in term_node will
+  // require an nid, vid and tid.
+  $results = db_query("SELECT nid, district_id " 
+                     ."FROM {district_node} " 
+                     ."WHERE added_to_term_node = 0 " );
+  while ($node = db_fetch_object($results)) {  
+  $i = 0;
+    $nid = $node->nid;
+    $district_id = $node->district_id;
+
+    // Get vid
+    $results = db_query("SELECT vid FROM {node} WHERE nid = %d ", $nid);
+    $vid = db_result($results);
+    // Get terms
+    $results = db_query("SELECT state, term_dist, term_leg, "
+                       ."term_party, term_dist_leg "
+                       ."FROM {district} "
+                       ."WHERE district_id = %d ", 
+                       $district_id);
+    $terms = db_fetch_array($results);
+      foreach ($terms as $term) {
+        $results = db_query("SELECT tid FROM {term_data} WHERE name = '%s'", $term);
+        $tid = db_result($results);
+        // Now that we have the tid, nid and vid, create a new record in term_node
+        db_query("INSERT INTO {term_node} (nid, vid, tid) "
+                ."VALUES (%d, %d, %d) ", 
+                 $nid, 
+                 $vid,
+                 $tid);
+      }
+    // Set added_to_term_node field to 1, to indicate that it has been added.
+    // Primary key in district_node is nid AND district_id.
+    db_query("UPDATE {district_node} "
+            ."SET added_to_term_node = 1 "
+	    ."WHERE nid = %d "
+	    ."AND district_id = %d ", 
+	    $nid, 
+	    $district_id);
+    } // end while
+    } // end if $i
+  // Set variable to indicate that 
+  // terms have been created
+  $today = date('F j') .', '. date('Y');
+  variable_set('district_term_node', $today);  
+}
+
+/**
+ * Now district_node has a bunch of new nodes
+ * with term_dist, but no district_id. Get district_ids
+ * from the district table.
+ */
+function district_getids() {
+  $results = db_query('SELECT d.district_id, dn.term_dist FROM {district} d '
+                      .'JOIN {district_node} dn ON d.term_dist = dn.term_dist '
+		      .'WHERE dn.district_id = 0');
+  while ($row = db_fetch_array($results)) {
+    $district_id = $row['district_id'];
+    $term_dist = $row['term_dist'];
+    db_query("{UPDATE {district_node} " 
+             ."SET district_id = %d "
+             ."WHERE term_dist = '%s' ", 
+             $district_id, 
+             $term_dist);
+  } 
+}
+/**
+ * Add geocoded nodes to the district_node table.
+ * Use their latitude/longitude coordinates to figure
+ * out their corresponding political districts.
+ * Each location node should have three records in district_node,
+ * matching up with one rep and two senate districts.
+ * 
+ */
+function district_nodes_new() {
+  // Find nodes with lat/lng coordinates that do not
+  // have district tags (they are not in district_node).
+  $results = db_query('SELECT li.nid, li.lid, l.latitude, l.longitude '
+                   .'FROM ({location_instance} li '
+		   .'INNER JOIN {location} l ON li.lid = l.lid) '
+		   .'LEFT JOIN {district_node} dn ON li.nid = dn.nid '
+		   .'WHERE (ISNULL(dn.nid)) '
+		   .'AND ABS(l.latitude) > 0 '
+		   .'AND ABS(l.longitude) > 0;'); 
+
+  while($node = db_fetch_object($results)) {
+    // Insert nid and lid into district_node
+    db_query('INSERT INTO {district_node} (nid, lid) '
+             ."VALUES (%d, %d)",
+	     $node->nid,
+	     $node->lid
+    );
+    // Get US Congressional district info from Sunlight Labs,
+    // and then add term_dist for Senate districts too. The 
+    // term_dist records are unique. By retrieving / composing
+    // term_dist here, we will be able to retreive district_id numbers
+    // easily from the district table in the next step.
+    $lat = $node->latitude;
+    $lng = $node->longitude;
+    $key = variable_get('sunlightlabs_key', null);
+    $base_url = "http://services.sunlightlabs.com/api/districts.getDistrictFromLatLong.xml?";
+    $request_url = $base_url ."apikey=". $key ."&latitude=". $lat ."&longitude=". $lng;
+    $xml = simplexml_load_file($request_url) or die("url not loading");
+    // Each geocoded node has three related federal political districts:
+    // a House district and two Senate districts. Update the new record
+    // that has already been added to district_node with the House district info.
+    // Then create two new records to match the same nid too its two corresponding 
+    // Senate districts. 
+    $state = $xml->districts->district->state;
+    $house_dist = $state .'-'. $xml->districts->district->number;
+    db_query('UPDATE {district_node} '
+              ."SET term_dist = '%s'"
+	      ."WHERE nid = %d",
+	      $house_dist,
+	      $node->nid
+    );
+    $senate_dist[0] = $state .'-Junior Seat';
+    $senate_dist[1] = $state .'-Senior Seat';
+    for ($i = 0; $i < 2; $i++) {
+      db_query('INSERT INTO {district_node} (term_dist, nid, lid) '
+               ."VALUES ('%s', %d, %d)",
+               $senate_dist[$i],
+       	       $node->nid,
+	       $node->lid
+
+    // AT THE END OF THIS PROCESS, THERE SEEMS TO BE 
+    // A ROW WHERE term_dist = null, nid = 0, lid = 0 and 
+
+  );}}  
+}
+
+/**
+ * Populate district table with Sunlight Labs data
+ * Menu callback for admin/settings/district/populate
+ */
+function district_populate() {
+  // Get Sunlight Labs API key
+  $key = variable_get('sunlightlabs_key', null);
+  $base_url = "http://services.sunlightlabs.com/api/legislators.getList.xml?";
+
+  // Iterate through states requesting data
+  $state = array('AL', 'AK', 'AS', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'GU', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'PR', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VI', 'VA', 'WA', 'WV', 'WI', 'WY');
+  foreach ($state as $state) {
+    $request_url = $base_url ."apikey=". $key ."&state=". $state; 
+    $xml = simplexml_load_file($request_url) or die("url not loading");
+  
+      // Iterate through records and insert data into district table
+      foreach ($xml->legislators->legislator as $legislator) {
+
+        // Call hook_insert() to insert records
+        district_insert($legislator);
+      }
+  }
+
+  // Set variable 'district_data_populated' to indicate
+  // that the district table has been populated with data
+  $today = date('F j') .', '. date('Y');
+  variable_set('district_data_populated', $today); 
+}
+
+/**
+ * Implementation of hook_insert()
+ */
+function district_insert($legislator) {
+  // As of 3/09, Sunlight Labs only provides
+  // data for federal-level districts. So for now,
+  // level is always "federal". I'm hopeful that they will
+  // extend their service to include state-level districts too.
+  // Meanwhile, this is a helpful field to have in the database,
+  // to take advantage of other organizations' APIs when level
+  // is required as a parameter.
+  $level = 'federal';
+
+  // Insert the record into the district table
+  db_query(
+    'INSERT INTO {district} '.
+      '(state, dist_name, level, leg_firstname, '.
+      'leg_lastname, leg_title, leg_party) '.
+      "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+      $legislator->state,
+      $legislator->district,
+      $level,
+      $legislator->firstname,
+      $legislator->lastname,
+      $legislator->title,
+      $legislator->party
+  );
+}
+
+/**
+ * Create district taxonomy
+ * Menu callback for admin/settings/district/taxonomy
+ *
+ */ 
+function district_taxonomy() {
+  // Create vocabularies: District, Legislator, Party, District/Legislator
+  // Build array of vocabulary names: State, District, Legislator, Party
+  // and District/Legislator
+  $vocab[] = 'State';
+  $vocab[] = 'District';
+  $vocab[] = 'Legislator';
+  $vocab[] = 'Party';
+  $vocab[] = 'District/Legislator';
+  // Check to see if vocab already exists.
+  // If it has not been created, create it.
+  foreach ($vocab as $vocab) {
+    $results = db_query ("SELECT vid FROM {vocabulary} WHERE name = '%s' ", $vocab);
+    $created = db_result($results);
+    $created = intval($created);
+    // Insert vocabs that have not been created ($created == 0)
+    if ($created == 0 ) {
+      db_query("INSERT INTO {vocabulary} (name, module) "
+               ."VALUES ('%s', '%s') ", $vocab, 'district');
+      // Get vid for new vocab.
+      $result = db_query("SELECT vid FROM {vocabulary} ORDER BY vid DESC LIMIT 1 ");
+      $vid = db_result($result);
+      // Match new vocab with content type "location" in 
+      // vocabulary_node_types table.
+      // NOTE: After testing, I disabled this function. Two 
+      // reasons: 1. It clutters up the Edit/Create node form
+      // to put this many terms there. 2. Why make the user go
+      // through this. THat's what this tool is for. Better to auto
+      // -mate this, I think. I'm leaving it here, in case users
+      // or administrators want the additional control. But I like
+      // it better this way I think.
+      // district_contenttype_insert($vid);
+      // Now add terms to vocabularies
+      district_terms_insert($vid, $vocab); 
+    }
+  }
+  // Set variable to indicate that District taxonomy
+  // (vacabularies and terms) has been created
+  $today = date('F j') .', '. date('Y');
+  variable_set('district_taxonomy_created', $today);
+}
+/**
+ * Implementation of hook_insert()
+ *
+ * Apply vocabularies to content type "location".
+ * in vocabulary_node_type table.
+ *
+ * NOTE: We assumes here that
+ * (1) the Location module is installed, 
+ * (2) the user created a content type called location,
+ * (3) there are no other vocabularies called
+ * State, District, Legislator, Party or District/Legislator.
+ *
+ */
+function district_contenttype_insert($vid) {
+  // $vid parameter passed by district_taxonomy(), 
+  // is a vocabulary id, not to be confused with
+  // version id). Each new $vid added to the vocabulary table
+  // should get added to vocabulary_node_types here
+  // along with content type "location".
+  db_query('INSERT INTO {vocabulary_node_types} (vid, type) '
+               ."VALUES ('%s', 'location')", $vid);
+}
+/**
+ * Implementation of hook_insert()
+ *
+ * Create vocabulary-specific terms from the
+ * district table. Taxonomy terms are stored in 
+ * the term_data table, in pairs of vid (vocab id)
+ * and term name. For each vocabulary, we need to 
+ * get the vid, then format the corresponding term.
+ *
+ * Each district in the district table
+ * has 5 related terms: State, District, Legislator, 
+ * Party, District/Legislator. If we keep track of these
+ * terms in the district table (in the term_* fields), 
+ * the district table can be used as a look up table later
+ * so we will fill in the district.term_* fields here too.
+ * State doesn't require any special formatting, so there 
+ * are only 4 term_* fields. 
+ * 
+ */
+function district_terms_insert($vid, $vocab) {
+  switch ($vocab) {
+    case 'State': 
+      // Pair up vid with unique state names from the district table.
+      // Insert these vid-state pairs into term_data.
+      $results = db_query("SELECT DISTINCT d.state FROM {district} d");
+      while ($state = db_result($results)) {
+      db_query('INSERT INTO {term_data} (vid, name) '
+               ."VALUES (%d, '%s')", 
+               $vid, 
+               $state);
+      }
+      break;
+    case 'District': 
+      // Pair up vid with re-formatted district names. 
+      // In the district table, dist_name
+      // values come directly from Sunlight Labs and 
+      // look like this: 8 or Senior Seat or Junior Seat.
+      // District terms should be more userfriendly. E.g. MA-8, 
+      // MA-Senior Seat, MA-Junior Seat. 
+      // Districts should be unique. But I include DISTINCT in this 
+      // SELECT statement for good measure.
+      $results = db_query("SELECT DISTINCT CONCAT((d.state), '-', (d.dist_name)) " 
+                           ."AS 'district' FROM {district} d");
+      while ($district = db_result($results)) {
+        db_query('INSERT INTO {term_data} (vid, name) '
+           ."VALUES (%d, '%s')", 
+           $vid, 
+           $district);
+      }
+      // Fill in the corresponding term_dist field in the district table.
+      db_query("UPDATE {district} d "
+               ."SET d.term_dist = CONCAT((d.state), '-', (d.dist_name)) ");
+      break;
+    case 'Legislator': 
+        // Pair up vid with legislators' names. To make legislators'
+        // names more user-friendly we will concatenate 
+        // [leg_title]. [leg_firstname] and [leg_lastname].
+        // E.g. Rep. Michael Capuano
+        $results = db_query("SELECT DISTINCT CONCAT((d.leg_title), '. ', (d.leg_firstname), ' ', (d.leg_lastname)) AS 'legislator' FROM {district} d ");
+        while ($legislator = db_result($results)) {
+          db_query('INSERT INTO {term_data} (vid, name) '
+                     ."VALUES (%d, '%s')", 
+                     $vid, 
+                     $legislator);
+        }
+        // Fill in term_leg in the district table.
+        db_query("UPDATE {district} d " 
+                  ."SET d.term_leg = CONCAT((d.leg_title), '. ', (d.leg_firstname), ' ', (d.leg_lastname)) ");
+      break;
+    case 'Party': 
+        // Now pair up vid with political parties. Here we will leave
+        // the party names as they are, R, D and I. With only three terms
+        // in this vocabulary, it's easy enough for users to make adjustments
+        // manually, if they prefer to have (R) or Republican, etc.
+        $results = db_query("SELECT DISTINCT leg_party FROM {district} "); 
+        while ($party = db_result($results)) {
+          db_query("INSERT INTO {term_data} (vid, name) "
+                   ."VALUES (%d, '%s') ", 
+                   $vid, 
+                   $party);
+        }
+        // Fill in term_leg in the district table. We're not doing any
+        // fancy formatting here, but filling in the field for consistency.
+        db_query("UPDATE {district} " 
+                  ."SET term_party = leg_party ");
+      break;
+    case 'District/Legislator': 
+        // Now pair up the vid with each record, with the following
+        // format: MA-1 (D) Rep. Michael Capuano
+        // or MA-Senior Seat (D) Democrat Edward Kennedy.
+        $results = db_query("SELECT CONCAT((state), '-', (dist_name), ' (', (leg_party), ') ', (leg_title), '. ', (leg_firstname), ' ', (leg_lastname)) AS 'dist_leg' FROM {district} ");
+        while ($dist_leg = db_result($results)) {
+          db_query('INSERT INTO {term_data} (vid, name) '
+                   ."VALUES (%d, '%s')", 
+                   $vid, 
+                   $dist_leg);
+        }
+        // Fill in term_dist_leg in the district table.
+        db_query("UPDATE {district} d SET d.term_dist_leg = CONCAT((d.state), '-', (d.dist_name), ' (', (d.leg_party), ') ', (d.leg_title), '. ', (d.leg_firstname), ' ', (d.leg_lastname)) ");
+      break;
+  }
+}
+/**
+ * Form builder.
+ *
+ * @see system_settings_form().
+ *
+ */
+function district_admin_settings() {
+  // Get/set Sunlight Labs API key
+  $form['register'] = array(
+    '#type' => 'fieldset',
+    // '#title' => t('Register'),
+    '#weight' => 0,
+  );
+  $form['register']['sunlightlabs_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sunlight Labs API Key'),
+    '#size' => 60,
+    '#default_value' => variable_get('sunlightlabs_key', null),
+    '#description' => t('<a href="@url">Register for a Sunlight Labs API key here: @url</a>', array('@url' => 'http://services.sunlightlabs.com/api/register/')),
+  );
+  $form['district_data'] = array(
+    '#type' => 'fieldset',
+    // '#title' => t('District Data'),
+    '#weight' => 1,
+  );
+  // Populate district table 
+  $date_populated = variable_get('district_data_populated', null);
+  if($date_populated == null) {
+    $form['district_data']['data_note'] = array(
+      '#type' => 'item',
+      '#title' => t('MODULE SET UP  Step 1 of 3 <br />Get Data'),
+      '#description' => t('After saving your Sunight Labs API Key '
+                          .'you can retreive district and legislator data '
+                          .'from Sunlight Labs. '),
+    );
+    $form['district_data']['district_populate'] = array(
+      '#type' => 'submit',
+      '#value' => t('Get Data'),
+      '#submit' => array('district_populate'),
+    );
+  } else {
+    $form['district_data']['district_populate'] = array(
+      '#type' => 'item',
+      '#title' => t('District Data'),
+      '#description' => t("The district table was populated with data from Sunlight Labs on: <strong>$date_populated</strong>.")
+    );
+    // Create District taxonomy 
+    $date_created = variable_get('district_taxonomy_created', null);
+    if($date_created == null) {
+      $form['district_data']['tax_note'] = array(
+        '#type' => 'item',
+        '#title' => t('MODULE SET UP  Step 2 of 3 <br />' 
+                      .'Create Vocabularies and Terms'),
+        '#description' => t('Use your district and legislator data '
+                            .'from Sunlight Labs to create taxonomy ' 
+                            .'vocabularies and terms. This includes 5 ' 
+                            .'vocabularies: State, District, Party, Legislator, '
+                            .'and District/Legislator. Each vocabulary is '
+                            .'filled with terms like MA, MA-1, Democrat, Rep. '
+                            .'Michael Capuano, and MA-1 (D) Rep. Michael Capuano, ' 
+                            .'respectively. '),
+      );
+      $form['district_data']['district_taxonomy'] = array(
+        '#type' => 'submit',
+        '#value' => t('Create Vocabs and Terms'),
+        '#submit' => array('district_taxonomy'),
+      );
+    } else {
+      $form['district_data']['district_taxonomy'] = array(
+        '#type' => 'item',
+	'#title' => t('District Taxonomy'),
+        '#description' =>  t("District vocabularies and terms were "
+                             ."create on <strong>$date_created</strong>, "
+                             ."based on data in the district table. District "
+                             ."and District/Legislator. These vocabularies "
+                             ."include with terms like: MA-1, Rep. Michael "
+                             ."Capuano, Democrat, and MA-1 (D) Rep. Michael "
+                             ."Capuano."),
+      );
+     $date = variable_get('district_term_node', null);
+     if($date == null) {
+     $form['district_data']['tax_note'] = array(
+        '#type' => 'item',
+        '#title' => t('MODULE SET UP  Step 3 of 3 <br />' 
+                      .'Apply Terms to Location Nodes'),
+        '#description' => t('Apply terms from new vocabularies to locations '
+                            .'(that is, nodes with the content type location).' ),
+      );
+      // Update locations without district tags
+      $form['district_data']['district_term_node'] = array(
+        '#type' => 'submit',
+	'#value' => t('Update Locations Without District Tags'),
+	'#submit' => array('district_term_node'),
+        );
+      } else {
+      $form['district_data']['tax_note'] = array(
+        '#type' => 'item',
+        '#title' => t('Apply Terms to Location Nodes'),
+        '#description' => t('Apply terms from District vocabularies to new locations. '
+                            ."<strong>Last updated on $date.</strong>" ),
+      );
+      // Update locations without district tags
+      $form['district_data']['district_term_node'] = array(
+        '#type' => 'submit',
+	'#value' => t('Update Locations Without District Tags'),
+	'#submit' => array('district_term_node'),
+        );
+      }
+    }
+  } 
+  return system_settings_form($form);
+}
+
+
+/* function district_admin_settings_form_submit($form, &$form_state) {
+  // Save Sunlight Labs API key
+  $form_values = $form_state['values'];
+  $value = check_plain($form_values['sunlightlabs_key']);
+  $name = 'sunlightlabs_key';
+  variable_set($name, $value);
+} */
+
+/*
+MODULE
+retrieve key from user and store it
+	check for googlemap_api_key
+
+	check for and set sunlightlabs_api_key
+
+	set_variable($key, '');
+
+Populate district table
+	Get all names and districts from Sunlight Labs
+		gender=m
+		gender=f
+	district_id
+	state
+	dist_name
+	level="federal"  when from Sunlight Labs
+	leg_name
+	leg_title
+	leg_party
+	term_dist
+	term_leg
+	term_party
+	term_dist_leg
+
+Create vocabularies
+districter_vocabularies()
+	_districter_vocabulary_district()
+	_districter_vocabulary_legislator()
+	_districter_vocabulary_party()
+	_districter_vocabulary_dist_leg()
+
+_districter_vocabulary_district()
+	INSERT INTO vocabulary (name, description, module)
+	VALUES ('District', 'political districts', 'districter');
+
+_districter_vocabulary_legislator()
+	INSERT INTO vocabulary (name, description, module)
+	VALUES ('Legislator', 'elected official', 'districter');
+
+_districter_vocabulary_party()
+	INSERT INTO vocabulary (name, description, module)
+	VALUES ('Party', 'political party', 'districter');
+
+_districter_vocabulary_dist_leg()
+	INSERT INTO vocabulary (name, description, module)
+	VALUES ('District/Legislator', 'political district and corresponding elected official', 'districter');
+
+
+Apply vocabularies to "location" content type
+  _district_get_vocab_ids()
+	queries, get vids from vocab table, store in associative array
+	$vid['dist'] = $query SELECT vid FROM vocabulary WHERE name='District'
+	$vid['leg'] =
+	$vid['party'] =
+	$vid['dist_leg'] =
+
+  _district_insert_vocab_ids()
+	INSTERT INTO vocabulary_node_types (vid, type)
+		$vid['dist'], 'location'
+		$vid['leg'], 'location'
+		$vid['party'], 'location'
+		$vid['dist_leg'], 'location'
+
+Add terms to vocabularies
+	query, SELECT term_dist, term_leg, term_party, term_dist_leg FROM district
+
+	INSERT INTO term_data (vid, name)
+	  for each ... as $term
+		$vid['dist'], $term['term_dist']
+		$vid['leg'], $term['term_leg']
+		$vid['party'], $term['term_party']
+		$vid['dist_leg'], $term['term_dist_leg']
+
+Create form/buttons
+	create vocabularies
+		set district_created timestamp
+		if district_created != 0, disable button
+
+		Note to user: We have not developed a refresh yet (to 
+		update legislators between elections. You can create,
+		update, and delete. This should be fine until 2010.
+		Delete/manage the vocab like any other taxonomy.
+		Delete the the districts table by uninstalling the module.
+
+Locations update
+        append nodes that need to be tagged to district_node
+		INSERT INTO district (nid, lid)
+		JOIN all location_instance and only matching district records
+		VALUES (location_instance.nid, location_instance.lid)
+		WHERE dist.nid = 0 
+		AND lat <> 0 
+		AND lng <> 0
+		
+	update district_id in district_node table
+		$lid = SELECT lid FROM district_node WHERE district_id = 0
+		Iterate through, getting lat/lng from locations table
+		  Use Sunlight API to get district
+		    Iterate through each record returned
+		      $did = SELECT district_id WHERE term_dist = "$state-$district"
+		      INSERT INTO district_node (district_id) 
+		        VALUES ($did)
+		        WHERE lid = $lid
+		
+	update term_node
+		JOIN (see diagram)
+
+		Iterate Through:
+			term_dist tags
+			term_leg tags
+			term_party tags
+			term_dist_leg tags
+*/
